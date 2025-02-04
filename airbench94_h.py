@@ -163,41 +163,45 @@ class CifarLoader:
 # -------------------------------
 # Official-style Harmonic Linear Layer (DistLayer)
 # -------------------------------
+
+
 class DistLayer(nn.Linear):
     def __init__(self, in_features, out_features, n=1., eps=1e-4, bias=False):
         """
         A harmonic linear layer that computes similarity via an inverse-power
         transformation of the normalized squared Euclidean distance.
-
+        All computations are enforced in FP32.
         Args:
             in_features: dimensionality of input features.
             out_features: number of classes.
             n (float): harmonic exponent.
             eps (float): small constant to avoid division by zero.
-            bias (bool): if True, adds a learnable bias (default: False).
+            bias (bool): if True, adds a learnable bias.
         """
         super(DistLayer, self).__init__(in_features, out_features, bias=bias)
         self.n = n
         self.eps = eps
 
-    def forward(self, x, scale=False):
-        # x: (B, N)
-        # self.weight: (V, N) where V is the number of classes.
-        w = self.weight
-        # Compute the inner product between each input and each weight.
-        wx = torch.einsum('bn,vn->bv', x, w)  # (B, V)
-        # Compute squared norm of each weight vector. Shape: (V,)
-        ww = torch.norm(w, dim=-1) ** 2
-        # Compute squared norm of each input. Shape: (B,)
-        xx = torch.norm(x, dim=-1) ** 2
+        # Initialize weights in FP32.
+        nn.init.normal_(self.weight, mean=0, std=1.0 / (in_features ** 0.5))
+        if bias:
+            nn.init.zeros_(self.bias)
 
-        # Compute squared Euclidean distances between x and each class center:
+    def forward(self, x, scale=False):
+        # Enforce FP32 precision for computations.
+        x_fp32 = x.float()
+        w_fp32 = self.weight.float()
+        # Compute inner products in FP32.
+        wx = torch.einsum('bn,vn->bv', x_fp32, w_fp32)  # (B, V)
+        # Compute squared norms in FP32.
+        ww = torch.norm(w_fp32, dim=-1)**2  # (V,)
+        xx = torch.norm(x_fp32, dim=-1)**2  # (B,)
+        # Compute squared Euclidean distances:
         #   dist_sq = ||w||^2 + ||x||^2 - 2*(x·w) + eps
         dist_sq = ww[None, :] + xx[:, None] - 2 * wx + self.eps
-
         # Normalize distances per sample (divide by the minimal value over classes).
-        dist_sq = dist_sq / torch.min(dist_sq, dim=-1, keepdim=True)[0]
-
+        min_val = torch.min(dist_sq, dim=-1, keepdim=True)[0]
+        dist_sq = dist_sq / (min_val + self.eps)
         # Return the inverse-power transformed distances.
         return (dist_sq) ** (-self.n)
 
@@ -207,8 +211,10 @@ class HarmonicLogits(nn.Module):
         super(HarmonicLogits, self).__init__()
 
     def forward(self, x):
+        # Enforce FP32 precision for computations.
+        x_fp32 = x.float()
         # Normalize harmonic scores into probabilities.
-        prob = x / torch.sum(x, dim=1, keepdim=True)
+        prob = x_fp32 / torch.sum(x_fp32, dim=1, keepdim=True)
         # Convert probabilities into logits as (-log(prob)).
         logits = -torch.log(prob)
         return logits
@@ -280,8 +286,9 @@ def make_net():
         ConvGroup(widths['block2'], widths['block3'], batchnorm_momentum),
         nn.MaxPool2d(3),
         Flatten(),
-        DistLayer(widths['block3'], 10, bias=False),
+        DistLayer(widths['block3'], 10, n=32., eps=1e-4, bias=False),
         HarmonicLogits(),
+        Mul(hyp['net']['scaling_factor']),
     )
     net[0].weight.requires_grad = False
     net = net.half().cuda()
@@ -397,7 +404,10 @@ def infer(model, loader, tta_level=0):
 
 def evaluate(model, loader, tta_level=0):
     logits = infer(model, loader, tta_level)
-    return (logits.argmax(1) == loader.labels).float().mean().item()
+    # Since the model outputs (-log(prob)) values,
+    # multiply by -1 so that higher scores correspond to more likely classes.
+    return ((-logits).argmax(1) == loader.labels).float().mean().item()
+
 
 ############################################
 #                Training                  #
@@ -475,7 +485,7 @@ def main(run):
         for inputs, labels in train_loader:
 
             outputs = model(inputs)
-            loss = outputs[torch.arange(labels.size(0)), labels].mean()
+            loss = outputs[torch.arange(labels.size(0)), labels].sum()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -500,7 +510,7 @@ def main(run):
         ####################
 
         # Save the accuracy and loss from the last training batch of the epoch
-        train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
+        train_acc = ((-outputs.detach()).argmax(1) == labels).float().mean().item()
         train_loss = loss.item() / batch_size
         val_acc = evaluate(model, test_loader, tta_level=0)
         print_training_details(locals(), is_final_entry=False)
